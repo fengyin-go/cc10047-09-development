@@ -1,5 +1,5 @@
 """实时流数据湖业务计算引擎：分区、合并、压缩、快照差异、保留策略、
-版本冲突、增量协调等核心算法实现。
+版本冲突、增量协调、摄入空区间证明与读段确认等核心算法实现。
 """
 from __future__ import annotations
 
@@ -263,6 +263,203 @@ def delta_reconciler(
         "batch_only": batch_only,
         "dedup_key": dedup_key,
         "checksum": checksum,
+    }
+
+
+# ------------------------------------------------------------------
+# 摄入空区间证明与读段确认
+# ------------------------------------------------------------------
+
+def build_read_segment(
+    source: str,
+    partition: str,
+    start_offset: int,
+    end_offset: int,
+    *,
+    read_rows: int,
+    read_result: str,
+    last_read_offset: int | None = None,
+) -> dict[str, Any]:
+    """构造一次读段（read segment）记录。
+
+    区间一律采用 [start_offset, end_offset) 左闭右开语义，例如 100..199
+    的完整扫描表示为 start=100, end=200。read_result 区分三类结果：
+    - "empty_ok"：区间被完整读取，且确认零行；
+    - "read_failed"：读取中途断线/失败，区间未读全，不能确认；
+    - "rows_ok"：区间读全且有数据落库。
+    """
+    if end_offset <= start_offset:
+        raise ValueError("读段区间必须满足 start_offset < end_offset")
+    if read_result not in ("empty_ok", "read_failed", "rows_ok"):
+        raise ValueError(f"未知读操作结果：{read_result}")
+    if read_result == "empty_ok" and read_rows != 0:
+        raise ValueError("空区间读全的读段 read_rows 必须为 0")
+    if read_result == "empty_ok" and last_read_offset is not None:
+        raise ValueError("空区间读全不存在最后读取偏移")
+    if read_result == "read_failed" and last_read_offset is not None and not (
+        start_offset <= last_read_offset < end_offset
+    ):
+        raise ValueError("最后读取偏移必须落在请求区间内；一行未读到时允许为空")
+    return {
+        "source": source,
+        "partition": partition,
+        "start_offset": start_offset,
+        "end_offset": end_offset,
+        "read_rows": read_rows,
+        "read_result": read_result,
+        "last_read_offset": last_read_offset,
+    }
+
+
+def read_ack_key(segment: dict[str, Any]) -> str:
+    """生成读段确认键。
+
+    零行读全（empty_ok）与读取失败（read_failed）走不同命名空间，
+    即使来源、分区、偏移区间完全相同也不会产生同一条确认：
+    empty:p1:100:200 与 fail:p1:100:200 永远不同。同一来源同一区间的
+    重复确认请求拿到同一个键，由调用方据此保证只确认一次。
+    """
+    kind = {
+        "empty_ok": "empty",
+        "read_failed": "fail",
+        "rows_ok": "rows",
+    }[segment["read_result"]]
+    return (
+        f"{kind}:{segment['source']}:{segment['partition']}:"
+        f"{segment['start_offset']}:{segment['end_offset']}"
+    )
+
+
+def build_empty_interval_proof(
+    source: str,
+    partition: str,
+    start_offset: int,
+    end_offset: int,
+    *,
+    proof_id: str,
+    scan_id: str,
+    read_at: str,
+) -> dict[str, Any]:
+    """构造摄入空区间证明：证明某个分区某偏移区间被实际读全且为零行。
+
+    证明只承载「实际覆盖的分区、偏移范围、读操作结果」三类可回查事实，
+    与读取失败的记录物理隔离（read_result 固定为 empty_ok）。
+    """
+    segment = build_read_segment(
+        source, partition, start_offset, end_offset,
+        read_rows=0, read_result="empty_ok",
+    )
+    return {
+        "proof_id": proof_id,
+        "scan_id": scan_id,
+        "source": source,
+        "partition": partition,
+        "covered_start_offset": start_offset,
+        "covered_end_offset": end_offset,
+        "covered_partition_data_range": f"{partition}:[{start_offset},{end_offset})",
+        "read_rows": 0,
+        "read_result": "empty_ok",
+        "read_at": read_at,
+        "status": "待确认",
+        "ack_key": read_ack_key(segment),
+    }
+
+
+def retain_unread_ranges_on_failure(
+    requested_start: int,
+    requested_end: int,
+    last_read_offset: int | None,
+) -> list[dict[str, int]]:
+    """读取中途断线时，计算仍需保留的未读历史数据范围。
+
+    失败绝不推进水位：last_read_offset 是最后一个「成功读取」的偏移，
+    下一次实际读取从 last_read_offset + 1 开始（完全没读到则从原起点重试）。
+    返回的范围同样是左闭右开区间。
+    """
+    if requested_end <= requested_start:
+        raise ValueError("请求区间必须满足 requested_start < requested_end")
+    if last_read_offset is None:
+        return [{"start_offset": requested_start, "end_offset": requested_end}]
+    if not (requested_start <= last_read_offset < requested_end):
+        raise ValueError("最后读取偏移必须落在请求区间内")
+    resume_start = last_read_offset + 1
+    if resume_start >= requested_end:
+        return []
+    return [{"start_offset": resume_start, "end_offset": requested_end}]
+
+
+def plan_next_read(
+    *,
+    confirmed_end_offset: int | None,
+    pending_ranges: list[dict[str, int]],
+    stream_end_offset: int,
+    largest_confirmed_end: int | None = None,
+) -> dict[str, Any]:
+    """根据检查点已确认水位和待办区间，规划下一次实际读取的数据范围。
+
+    断线后未读的历史区间优先（不能跳过历史数据）；没有待办时才沿
+    已确认水位向流末端续读。严格连续水位缺失时（例如首个登记窗口不从
+    偏移 0 开始），退而使用最大已确认区间末端作为续读起点。
+    """
+    if pending_ranges:
+        ordered = sorted(pending_ranges, key=lambda r: r["start_offset"])
+        nxt = ordered[0]
+        return {
+            "mode": "retry_pending",
+            "start_offset": nxt["start_offset"],
+            "end_offset": nxt["end_offset"],
+            "data_range": f"[{nxt['start_offset']},{nxt['end_offset']})",
+            "reason": "存在断线后保留的未读历史区间，优先续读",
+        }
+    start = confirmed_end_offset
+    if start is None:
+        start = 0 if largest_confirmed_end is None else largest_confirmed_end
+    if start >= stream_end_offset:
+        return {
+            "mode": "idle",
+            "start_offset": start,
+            "end_offset": start,
+            "data_range": f"[{start},{start})",
+            "reason": "已确认水位到达流末端，暂无新数据",
+        }
+    return {
+        "mode": "continuous",
+        "start_offset": start,
+        "end_offset": stream_end_offset,
+        "data_range": f"[{start},{stream_end_offset})",
+        "reason": "无待办区间，沿检查点水位续读",
+    }
+
+
+def build_checkpoint_resume(
+    *,
+    source: str,
+    partition: str,
+    confirmed_end_offset: int | None,
+    pending_ranges: list[dict[str, int]],
+    stream_end_offset: int,
+    last_proof_id: str | None = None,
+    largest_confirmed_end: int | None = None,
+) -> dict[str, Any]:
+    """检查点读取空区间证明后产出的恢复视图：待办随读段确认一并更新。"""
+    next_read = plan_next_read(
+        confirmed_end_offset=confirmed_end_offset,
+        pending_ranges=pending_ranges,
+        stream_end_offset=stream_end_offset,
+        largest_confirmed_end=largest_confirmed_end,
+    )
+    return {
+        "source": source,
+        "partition": partition,
+        "confirmed_end_offset": confirmed_end_offset,
+        "pending_ranges": [dict(r) for r in pending_ranges],
+        "stream_end_offset": stream_end_offset,
+        "next_read_partition": partition,
+        "next_read_start_offset": next_read["start_offset"],
+        "next_read_end_offset": next_read["end_offset"],
+        "next_read_data_range": next_read["data_range"],
+        "next_read_mode": next_read["mode"],
+        "last_proof_id": last_proof_id,
     }
 
 

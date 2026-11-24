@@ -36,3 +36,32 @@ class StreamCheckpointService(BaseModuleService):
             "retention_hours": 24,
             "checksum": hashlib.sha256(str(entry).encode()).hexdigest()[:16],
         }
+
+    def domain_load_ingest_proofs(
+        self, source: str, partition: str,
+    ) -> dict[str, Any]:
+        """检查点读取摄入空区间证明并恢复待办。
+
+        汇总当前分区的空区间证明、读段确认与落湖台账，并输出下一次实际
+        读取的分区数据范围和起始偏移；待办随读段确认一并更新。
+        """
+        from app.ingest_runtime import ingest_runtime
+
+        proofs = ingest_runtime.list_proofs(source, partition)
+        acks = ingest_runtime.list_acks(source, partition)
+        resume = ingest_runtime.resume_view(source, partition)
+        return {
+            "ok": True,
+            "checkpoint_service": self.MODULE,
+            "source": source,
+            "partition": partition,
+            "proofs": proofs,
+            "acks": acks,
+            "pending_ranges": resume["pending_ranges"],
+            "confirmed_end_offset": resume["confirmed_end_offset"],
+            "next_read_partition": resume["next_read_partition"],
+            "next_read_start_offset": resume["next_read_start_offset"],
+            "next_read_end_offset": resume["next_read_end_offset"],
+            "next_read_data_range": resume["next_read_data_range"],
+            "next_read_mode": resume["next_read_mode"],
+        }
